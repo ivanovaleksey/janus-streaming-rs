@@ -1,12 +1,21 @@
+extern crate amy;
 #[macro_use]
 extern crate cstr_macro;
 #[macro_use]
 extern crate janus_plugin;
 #[macro_use]
 extern crate lazy_static;
+#[macro_use]
+extern crate serde_json;
 
+use std::collections::HashMap;
 use std::os::raw::{c_int, c_char, c_void};
+use std::net::UdpSocket;
 use std::sync::{Mutex, RwLock, mpsc};
+use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use amy::{Event, Poller};
 use janus_plugin::{PluginCallbacks, PluginSession, RawPluginResult, PluginResult,
                    PluginResultType, RawJanssonValue, JanssonValue};
 
@@ -25,6 +34,7 @@ unsafe impl std::marker::Send for Message {}
 lazy_static! {
     static ref CHANNEL: Mutex<Option<mpsc::Sender<Message>>> = Mutex::new(None);
     static ref SESSIONS: RwLock<Vec<Box<Session>>> = RwLock::new(Vec::new());
+    static ref SOCKETS: RwLock<HashMap<usize, UdpSocket>> = RwLock::new(HashMap::new());
 }
 
 static mut GATEWAY: Option<&PluginCallbacks> = None;
@@ -47,7 +57,24 @@ extern "C" fn init(callback: *mut PluginCallbacks, _config_path: *const c_char) 
     let (tx, rx) = mpsc::channel();
     *(CHANNEL.lock().unwrap()) = Some(tx);
 
-    std::thread::spawn(move || { message_handler(rx); });
+    let poller = Poller::new().unwrap();
+    let registrar = poller.get_registrar().unwrap();
+
+    let video_socket = UdpSocket::bind("0.0.0.0:5004").expect("couldn't bind to video socket");
+    video_socket.set_nonblocking(true).expect("set_nonblocking call failed");
+
+    let video_socket_id = registrar.register(&video_socket, Event::Read).unwrap();
+    SOCKETS.write().unwrap().insert(video_socket_id, video_socket);
+
+    let audio_socket = UdpSocket::bind("0.0.0.0:5002").expect("couldn't bind to audio socket");
+    audio_socket.set_nonblocking(true).expect("set_nonblocking call failed");
+
+    let audio_socket_id = registrar.register(&audio_socket, Event::Read).unwrap();
+    SOCKETS.write().unwrap().insert(audio_socket_id, audio_socket);
+
+    thread::spawn(move || { poll(poller) });
+    thread::spawn(move || { message_handler(rx); });
+
     0
 }
 
@@ -70,8 +97,8 @@ extern "C" fn destroy_session(_handle: *mut PluginSession, _error: *mut c_int) {
 extern "C" fn handle_message(
     handle: *mut PluginSession,
     transaction: *mut c_char,
-    message: *mut RawJanssonValue,
-    jsep: *mut RawJanssonValue,
+    raw_message: *mut RawJanssonValue,
+    raw_jsep: *mut RawJanssonValue,
 ) -> *mut RawPluginResult {
 
     janus_plugin::log(
@@ -79,37 +106,39 @@ extern "C" fn handle_message(
         "--> janus_streaming_handle_message!!!",
     );
 
-    let _session: &Session = unsafe {
-        let handle_ref = handle.as_ref().unwrap();
-        (handle_ref.plugin_handle as *mut Session).as_ref()
-    }.unwrap();
+    let message = unsafe { JanssonValue::new(raw_message) }.unwrap();
+    let message_json: serde_json::Value = parse_message(message.clone());
+    println!("{:?}", message_json);
 
-    let mutex = CHANNEL.lock().unwrap();
-    let tx = mutex.as_ref().unwrap();
+    if message_json["request"] == json!("watch") || message_json["request"] == json!("start") {
+        let jsep = unsafe { JanssonValue::new(raw_jsep) };
 
-    let message = unsafe { JanssonValue::new(message) };
-    let jsep = unsafe { JanssonValue::new(jsep) };
+        let msg = Message {
+            handle: handle,
+            transaction: transaction,
+            message: Some(message),
+            jsep: jsep,
+        };
 
-    let msg = Message {
-        handle: handle,
-        transaction: transaction,
-        message: message,
-        jsep: jsep,
-    };
-    janus_plugin::log(
-        janus_plugin::LogLevel::Verb,
-        "--> sending message to channel",
-    );
-    tx.send(msg).expect(
-        "Sending to channel has failed",
-    );
+        let mutex = CHANNEL.lock().unwrap();
+        let tx = mutex.as_ref().unwrap();
 
-    let result = PluginResult::new(
-        PluginResultType::JANUS_PLUGIN_OK_WAIT,
-        cstr!("Rust string"),
-        None,
-    );
-    result.into_raw()
+        janus_plugin::log(
+            janus_plugin::LogLevel::Verb,
+            "--> Sending message to channel",
+        );
+        tx.send(msg).expect(
+            "Sending to channel has failed",
+        );
+
+        PluginResult::new(
+            PluginResultType::JANUS_PLUGIN_OK_WAIT,
+            std::ptr::null_mut(),
+            None,
+        ).into_raw()
+    } else {
+        unreachable!()
+    }
 }
 
 extern "C" fn setup_media(_handle: *mut PluginSession) {}
@@ -136,7 +165,109 @@ extern "C" fn incoming_data(_handle: *mut PluginSession, _buf: *mut c_char, _len
 
 extern "C" fn slow_link(_handle: *mut PluginSession, _uplink: c_int, _video: c_int) {}
 
-fn message_handler(_rx: mpsc::Receiver<Message>) {}
+fn message_handler(rx: mpsc::Receiver<Message>) {
+    janus_plugin::log(janus_plugin::LogLevel::Verb, "--> Start handling thread");
+
+    let watch_request = json!("watch");
+
+    for received in rx.iter() {
+        janus_plugin::log(
+            janus_plugin::LogLevel::Verb,
+            &format!("--> message_handler, received: {:?}", received),
+        );
+
+        let message = received.message.unwrap();
+        let message_json: serde_json::Value = parse_message(message);
+
+        if message_json["request"] == watch_request {
+            janus_plugin::log(janus_plugin::LogLevel::Verb, "--> Handling watch request");
+
+            let jsep_json = json!({ "type": "offer", "sdp": generate_sdp_offer() });
+            let jsep: JanssonValue = JanssonValue::from_str(
+                &jsep_json.to_string(),
+                janus_plugin::JanssonDecodingFlags::empty(),
+            ).unwrap();
+
+            let event_json = json!({ "result": "ok" });
+            let event: JanssonValue = JanssonValue::from_str(
+                &event_json.to_string(),
+                janus_plugin::JanssonDecodingFlags::empty(),
+            ).unwrap();
+
+            let push_event_fn = acquire_gateway().push_event;
+            janus_plugin::get_result(push_event_fn(
+                received.handle,
+                &mut PLUGIN,
+                received.transaction,
+                event.as_mut_ref(),
+                jsep.as_mut_ref(),
+            )).expect("Pushing event has failed");
+        }
+    }
+}
+
+fn parse_message(msg: JanssonValue) -> serde_json::Value {
+    let message_str: String = msg.to_string(janus_plugin::JanssonEncodingFlags::empty());
+    serde_json::from_str(&message_str).unwrap()
+}
+
+fn generate_sdp_offer() -> String {
+    let mut sdp = String::new();
+
+    sdp.push_str("v=0\r\n");
+
+    let sys_time = SystemTime::now();
+    let time_since = sys_time.duration_since(UNIX_EPOCH).unwrap();
+    let nanos = time_since.as_secs() * 1_000_000 + time_since.subsec_nanos() as u64;
+    sdp.push_str(&format!("o=- {} {} IN IP4 127.0.0.1\r\n", nanos, nanos));
+
+    sdp.push_str("s=Mountpoint 1\r\n");
+    sdp.push_str("t=0 0\r\n");
+
+    sdp.push_str("m=audio 1 RTP/SAVPF 111\r\n");
+    sdp.push_str("c=IN IP4 1.1.1.1\r\n");
+    sdp.push_str("a=rtpmap:111 opus/48000/2\r\n");
+    sdp.push_str("a=sendonly\r\n");
+
+    sdp.push_str("m=video 1 RTP/SAVPF 100\r\n");
+    sdp.push_str("c=IN IP4 1.1.1.1\r\n");
+    sdp.push_str("a=rtpmap:100 VP8/90000\r\n");
+    sdp.push_str("a=rtcp-fb:100 nack\r\n");
+    sdp.push_str("a=rtcp-fb:100 goog-remb\r\n");
+    sdp.push_str("a=sendonly\r\n");
+
+    janus_plugin::log(
+        janus_plugin::LogLevel::Verb,
+        &format!("--> Going to offer this SDP: {:?}", sdp),
+    );
+
+    sdp
+}
+
+fn poll(mut poller: Poller) {
+    janus_plugin::log(janus_plugin::LogLevel::Verb, "--> Start polling thread");
+
+    let mut buf = [0; 1500];
+    loop {
+        let notifications = poller.wait(0).unwrap();
+        for n in notifications {
+            println!("Notification: {:?}", n);
+            if let Some(socket) = SOCKETS.read().unwrap().get(&n.id) {
+                match n.event {
+                    Event::Read => {
+                        let (number_of_bytes, src_addr) = socket.recv_from(&mut buf).expect("Didn't receive data");
+                        println!("number_of_bytes: {:?}, src_addr: {:?}\n", number_of_bytes, src_addr);
+                    },
+                    _ => ()
+                }
+            }
+        }
+    }
+}
+
+fn acquire_gateway() -> &'static PluginCallbacks {
+    unsafe { GATEWAY }.expect("Gateway is NONE")
+}
 
 const PLUGIN: janus_plugin::Plugin = build_plugin!(
     METADATA,
