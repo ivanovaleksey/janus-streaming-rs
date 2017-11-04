@@ -3,6 +3,7 @@ name = "janus-streaming-rs"
 version = "0.1.0"
 dependencies = [
  "amy 0.8.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "bitfield 0.12.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "cstr-macro 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "janus-plugin 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "lazy_static 0.2.9 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -17,6 +18,11 @@ dependencies = [
  "libc 0.2.33 (registry+https://github.com/rust-lang/crates.io-index)",
  "nix 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
+
+[[package]]
+name = "bitfield"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
 name = "bitflags"
@@ -240,6 +246,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [metadata]
 "checksum amy 0.8.1 (registry+https://github.com/rust-lang/crates.io-index)" = "02e8735796e9f14cee044e23d536f2082577767996b0731229e202be4fd00d17"
+"checksum bitfield 0.12.1 (registry+https://github.com/rust-lang/crates.io-index)" = "ce82aa1082cbfdaa1c5e4c44b832d3e7fcf8d672033553f4e3a32487901e05ac"
 "checksum bitflags 0.4.0 (registry+https://github.com/rust-lang/crates.io-index)" = "8dead7461c1127cf637931a1e50934eb6eee8bff2f74433ac7909e9afcee04a3"
 "checksum bitflags 0.9.1 (registry+https://github.com/rust-lang/crates.io-index)" = "4efd02e230a02e18f92fc2735f44597385ed02ad8f831e7c1c1156ee5e1ab3a5"
 "checksum bitflags 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)" = "f5cde24d1b2e2216a726368b2363a273739c91f4e3eb4e0dd12d672d396ad989"

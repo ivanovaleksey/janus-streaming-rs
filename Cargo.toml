@@ -8,6 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 amy = "0.8"
+bitfield = "0.12"
 cstr-macro = "0.1.0"
 janus-plugin = "*"
 lazy_static = "*"

@@ -1,5 +1,7 @@
 extern crate amy;
 #[macro_use]
+extern crate bitfield;
+#[macro_use]
 extern crate cstr_macro;
 #[macro_use]
 extern crate janus_plugin;
@@ -20,7 +22,11 @@ use janus_plugin::{PluginCallbacks, PluginSession, RawPluginResult, PluginResult
                    PluginResultType, RawJanssonValue, JanssonValue};
 
 #[derive(Debug)]
-struct Session;
+struct Session {
+    handle: *mut PluginSession,
+}
+unsafe impl std::marker::Send for Session {}
+unsafe impl std::marker::Sync for Session {}
 
 #[derive(Debug)]
 struct Message {
@@ -30,6 +36,18 @@ struct Message {
     jsep: Option<JanssonValue>,
 }
 unsafe impl std::marker::Send for Message {}
+
+bitfield!{
+    struct RtpHeader(MSB0 [u8]);
+    impl Debug;
+    u8;
+    get_version, _: 1, 0;
+    get_padding, _: 2, 2;
+    get_extension, _: 3, 3;
+    get_csrc, _: 7, 4;
+    get_marker, set_marker: 8, 8;
+    get_payload_type, set_payload_type: 15, 9;
+}
 
 lazy_static! {
     static ref CHANNEL: Mutex<Option<mpsc::Sender<Message>>> = Mutex::new(None);
@@ -66,11 +84,11 @@ extern "C" fn init(callback: *mut PluginCallbacks, _config_path: *const c_char) 
     let video_socket_id = registrar.register(&video_socket, Event::Read).unwrap();
     SOCKETS.write().unwrap().insert(video_socket_id, video_socket);
 
-    let audio_socket = UdpSocket::bind("0.0.0.0:5002").expect("couldn't bind to audio socket");
-    audio_socket.set_nonblocking(true).expect("set_nonblocking call failed");
+    // let audio_socket = UdpSocket::bind("0.0.0.0:5002").expect("couldn't bind to audio socket");
+    // audio_socket.set_nonblocking(true).expect("set_nonblocking call failed");
 
-    let audio_socket_id = registrar.register(&audio_socket, Event::Read).unwrap();
-    SOCKETS.write().unwrap().insert(audio_socket_id, audio_socket);
+    // let audio_socket_id = registrar.register(&audio_socket, Event::Read).unwrap();
+    // SOCKETS.write().unwrap().insert(audio_socket_id, audio_socket);
 
     thread::spawn(move || { poll(poller) });
     thread::spawn(move || { message_handler(rx); });
@@ -81,10 +99,13 @@ extern "C" fn init(callback: *mut PluginCallbacks, _config_path: *const c_char) 
 extern "C" fn destroy() {}
 
 extern "C" fn create_session(handle: *mut PluginSession, _error: *mut c_int) {
-    let handle = unsafe { &mut *handle };
-    let mut session = Box::new(Session {});
+    let mut session = Box::new(Session { handle: handle });
 
+    let handle = unsafe { &mut *handle };
     handle.plugin_handle = session.as_mut() as *mut Session as *mut c_void;
+
+    println!("--> create_session: {:?}", session);
+
     SESSIONS.write().unwrap().push(session);
 }
 
@@ -133,7 +154,8 @@ extern "C" fn handle_message(
 
         PluginResult::new(
             PluginResultType::JANUS_PLUGIN_OK_WAIT,
-            std::ptr::null_mut(),
+            // std::ptr::null_mut(),
+            cstr!("REzzz"),
             None,
         ).into_raw()
     } else {
@@ -141,7 +163,12 @@ extern "C" fn handle_message(
     }
 }
 
-extern "C" fn setup_media(_handle: *mut PluginSession) {}
+extern "C" fn setup_media(_handle: *mut PluginSession) {
+    janus_plugin::log(
+        janus_plugin::LogLevel::Verb,
+        "--> setup_media",
+    );
+}
 
 extern "C" fn hangup_media(_handle: *mut PluginSession) {}
 
@@ -247,16 +274,47 @@ fn generate_sdp_offer() -> String {
 fn poll(mut poller: Poller) {
     janus_plugin::log(janus_plugin::LogLevel::Verb, "--> Start polling thread");
 
-    let mut buf = [0; 1500];
+    let mut buf: [u8; 1500] = [0; 1500];
+    let sockets = SOCKETS.read().unwrap();
+    println!("{:?}", sockets);
+    let relay_rtp_fn = acquire_gateway().relay_rtp;
+
     loop {
         let notifications = poller.wait(0).unwrap();
         for n in notifications {
-            println!("Notification: {:?}", n);
-            if let Some(socket) = SOCKETS.read().unwrap().get(&n.id) {
+            // println!("{:?}", n);
+            if let Some(socket) = sockets.get(&n.id) {
                 match n.event {
                     Event::Read => {
                         let (number_of_bytes, src_addr) = socket.recv_from(&mut buf).expect("Didn't receive data");
-                        println!("number_of_bytes: {:?}, src_addr: {:?}\n", number_of_bytes, src_addr);
+                        // println!("number_of_bytes: {:?}, src_addr: {:?}", number_of_bytes, src_addr);
+
+                        let ptype = if n.id == 1 { 100 } else { 111 };
+
+                        // Works!!!
+                        let mut header = RtpHeader(&mut buf[..]);
+                        header.set_payload_type(ptype);
+
+                        // // println!("--> {:?}", boxed_session);
+                        let boxed_session = &SESSIONS.read().unwrap()[0];
+
+                        let is_video = if n.id == 1 { 1 } else { 0 };
+                        // let ptr = (&buf).as_ptr();
+                        // let buf_ptr = ptr as *mut u8 as *mut i8;
+
+                        // unsafe {
+                        //     janus_rtp_set_type(buf_ptr, ptype as i32);
+                        // }
+                        relay_rtp_fn(
+                            boxed_session.handle,
+                            is_video as c_int,
+                            // &buf[0] as *const u8 as *mut c_char,
+                            // buf[0..number_of_bytes].as_mut_ptr() as *mut c_char,
+                            // ptr as *mut u8 as *mut i8,
+                            // buf_ptr,
+                            header.0.as_mut_ptr() as *mut c_char,
+                            number_of_bytes as c_int,
+                        );
                     },
                     _ => ()
                 }
@@ -286,3 +344,7 @@ const PLUGIN: janus_plugin::Plugin = build_plugin!(
 );
 
 export_plugin!(&PLUGIN);
+
+extern "C" {
+    fn janus_rtp_set_type(buf: *mut c_char, ptype: c_int);
+}
