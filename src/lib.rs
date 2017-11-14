@@ -75,14 +75,14 @@ extern "C" fn init(callback: *mut PluginCallbacks, _config_path: *const c_char) 
     let (tx, rx) = mpsc::channel();
     *(CHANNEL.lock().unwrap()) = Some(tx);
 
-    let poller = Poller::new().unwrap();
-    let registrar = poller.get_registrar().unwrap();
+    // let poller = Poller::new().unwrap();
+    // let registrar = poller.get_registrar().unwrap();
 
-    let video_socket = UdpSocket::bind("0.0.0.0:5004").expect("couldn't bind to video socket");
-    video_socket.set_nonblocking(true).expect("set_nonblocking call failed");
+    // let video_socket = UdpSocket::bind("0.0.0.0:5004").expect("couldn't bind to video socket");
+    // video_socket.set_nonblocking(true).expect("set_nonblocking call failed");
 
-    let video_socket_id = registrar.register(&video_socket, Event::Read).unwrap();
-    SOCKETS.write().unwrap().insert(video_socket_id, video_socket);
+    // let video_socket_id = registrar.register(&video_socket, Event::Read).unwrap();
+    // SOCKETS.write().unwrap().insert(video_socket_id, video_socket);
 
     // let audio_socket = UdpSocket::bind("0.0.0.0:5002").expect("couldn't bind to audio socket");
     // audio_socket.set_nonblocking(true).expect("set_nonblocking call failed");
@@ -90,7 +90,7 @@ extern "C" fn init(callback: *mut PluginCallbacks, _config_path: *const c_char) 
     // let audio_socket_id = registrar.register(&audio_socket, Event::Read).unwrap();
     // SOCKETS.write().unwrap().insert(audio_socket_id, audio_socket);
 
-    thread::spawn(move || { poll(poller) });
+    thread::spawn(move || { poll() });
     thread::spawn(move || { message_handler(rx); });
 
     0
@@ -271,58 +271,6 @@ fn generate_sdp_offer() -> String {
     sdp
 }
 
-fn poll(mut poller: Poller) {
-    janus_plugin::log(janus_plugin::LogLevel::Verb, "--> Start polling thread");
-
-    let mut buf: [u8; 1500] = [0; 1500];
-    let sockets = SOCKETS.read().unwrap();
-    println!("{:?}", sockets);
-    let relay_rtp_fn = acquire_gateway().relay_rtp;
-
-    loop {
-        let notifications = poller.wait(0).unwrap();
-        for n in notifications {
-            // println!("{:?}", n);
-            if let Some(socket) = sockets.get(&n.id) {
-                match n.event {
-                    Event::Read => {
-                        let (number_of_bytes, src_addr) = socket.recv_from(&mut buf).expect("Didn't receive data");
-                        // println!("number_of_bytes: {:?}, src_addr: {:?}", number_of_bytes, src_addr);
-
-                        let ptype = if n.id == 1 { 100 } else { 111 };
-
-                        // Works!!!
-                        let mut header = RtpHeader(&mut buf[..]);
-                        header.set_payload_type(ptype);
-
-                        // // println!("--> {:?}", boxed_session);
-                        let boxed_session = &SESSIONS.read().unwrap()[0];
-
-                        let is_video = if n.id == 1 { 1 } else { 0 };
-                        // let ptr = (&buf).as_ptr();
-                        // let buf_ptr = ptr as *mut u8 as *mut i8;
-
-                        // unsafe {
-                        //     janus_rtp_set_type(buf_ptr, ptype as i32);
-                        // }
-                        relay_rtp_fn(
-                            boxed_session.handle,
-                            is_video as c_int,
-                            // &buf[0] as *const u8 as *mut c_char,
-                            // buf[0..number_of_bytes].as_mut_ptr() as *mut c_char,
-                            // ptr as *mut u8 as *mut i8,
-                            // buf_ptr,
-                            header.0.as_mut_ptr() as *mut c_char,
-                            number_of_bytes as c_int,
-                        );
-                    },
-                    _ => ()
-                }
-            }
-        }
-    }
-}
-
 fn acquire_gateway() -> &'static PluginCallbacks {
     unsafe { GATEWAY }.expect("Gateway is NONE")
 }
@@ -348,3 +296,63 @@ export_plugin!(&PLUGIN);
 extern "C" {
     fn janus_rtp_set_type(buf: *mut c_char, ptype: c_int);
 }
+
+extern crate futures;
+#[macro_use]
+extern crate tokio_core;
+
+use std::{env, io};
+use std::net::SocketAddr;
+
+use futures::{Future, Poll};
+// use tokio_core::net::UdpSocket;
+use tokio_core::reactor::Core;
+
+struct Server {
+    socket: tokio_core::net::UdpSocket,
+    buf: Vec<u8>,
+}
+
+impl Future for Server {
+    type Item = ();
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        let relay_rtp_fn = acquire_gateway().relay_rtp;
+
+        loop {
+            let (size, _socket) = try_nb!(self.socket.recv_from(&mut self.buf));
+            let mut header = RtpHeader(&mut self.buf);
+            header.set_payload_type(100);
+            let boxed_session = &SESSIONS.read().unwrap()[0];
+            relay_rtp_fn(
+                boxed_session.handle,
+                1 as c_int,
+                header.0.as_mut_ptr() as *mut c_char,
+                size as c_int,
+            );
+        }
+    }
+}
+
+fn poll() {
+    janus_plugin::log(janus_plugin::LogLevel::Verb, "--> Start polling thread");
+
+    let addr = env::args().nth(1).unwrap_or("0.0.0.0:5004".to_string());
+    let addr = addr.parse::<SocketAddr>().unwrap();
+
+    // Create the event loop that will drive this server, and also bind the
+    // socket we'll be listening to.
+    let mut l = Core::new().unwrap();
+    let handle = l.handle();
+    let socket = tokio_core::net::UdpSocket::bind(&addr, &handle).unwrap();
+    println!("Listening on: {}", socket.local_addr().unwrap());
+
+    // Next we'll create a future to spawn (the one we defined above) and then
+    // we'll run the event loop by running the future.
+    l.run(Server {
+        socket: socket,
+        buf: vec![0; 1_500],
+    }).unwrap();
+}
+

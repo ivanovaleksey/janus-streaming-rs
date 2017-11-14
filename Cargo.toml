@@ -13,3 +13,6 @@ cstr-macro = "0.1.0"
 janus-plugin = "*"
 lazy_static = "*"
 serde_json = "1.0"
+
+tokio-core = "*"
+futures = "*"
